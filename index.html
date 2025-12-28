@@ -1443,7 +1443,7 @@ import { createClient } from 'https://cdn.jsdelivr.net/npm/@supabase/supabase-js
 
 // Define the Supabase URL and Key
 const supabaseUrl = 'https://mmsmjkqozvwvxmlsltir.supabase.co';
-const supabaseKey = 'sb_publishable__ZhYp1Z8Niphcf9NlQjAQA_oW-3RNt9';
+const supabaseKey = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im1tc21qa3FvenZ3dnhtbHNsdGlyIiwicm9sZSI6ImFub24iLCJpYXQiOjE3MzUzNTQyMjcsImV4cCI6MjA1MDkzMDIyN30.1mBf53mF4qG_XfGNOBc9wSn-HS0j_xHBXjYvSzB6IqI';
 
 // Initialize Supabase client
 const supabase = createClient(supabaseUrl, supabaseKey);
@@ -1504,7 +1504,7 @@ let IDLE_TIMEOUT = 10000;
 let idleTimer;
 let currentUser = null;
 
-// Bucket name - make sure this matches your Supabase bucket
+// Bucket name - IMPORTANT: This must match your Supabase bucket name exactly
 const BUCKET_NAME = 'inspire-board';
 
 // Rose petal emojis
@@ -1650,21 +1650,24 @@ signupForm?.addEventListener('submit', async (e) => {
     
     if (data.user) {
       // Create user profile in the database
-      const { error: profileError } = await supabase
-        .from('profiles')
-        .insert([
-          {
-            id: data.user.id,
-            username: username,
-            email: email,
-            avatar_color: `hsl(${Math.floor(Math.random() * 360)}, 70%, 60%)`,
-            created_at: new Date()
-          }
-        ]);
-      
-      if (profileError) {
-        console.error('Profile creation error:', profileError);
-        // Still continue even if profile creation fails
+      try {
+        const { error: profileError } = await supabase
+          .from('profiles')
+          .insert([
+            {
+              id: data.user.id,
+              username: username,
+              email: email,
+              avatar_color: `hsl(${Math.floor(Math.random() * 360)}, 70%, 60%)`,
+              created_at: new Date()
+            }
+          ]);
+        
+        if (profileError) {
+          console.error('Profile creation error:', profileError);
+        }
+      } catch (profileError) {
+        console.error('Profile error:', profileError);
       }
       
       // Check if email confirmation is required
@@ -1674,7 +1677,6 @@ signupForm?.addEventListener('submit', async (e) => {
         loginFormDiv.style.display = 'block';
       } else if (!data.user.email_confirmed_at) {
         showNotification('Account created! Please check your email to confirm.', '📧');
-        // Switch to login form
         signupFormDiv.style.display = 'none';
         loginFormDiv.style.display = 'block';
       } else {
@@ -1784,6 +1786,28 @@ loginDropdownBtn?.addEventListener('click', () => {
 
 // ==================== DATABASE FUNCTIONS ====================
 
+// Create images table if not exists
+async function ensureTableExists() {
+  try {
+    // Check if images table exists
+    const { error } = await supabase
+      .from('images')
+      .select('id')
+      .limit(1);
+    
+    if (error && error.message.includes('does not exist')) {
+      console.log('Images table does not exist. You need to create it in Supabase dashboard.');
+      showNotification('Database table not found. Please create "images" table.', '⚠️');
+      return false;
+    }
+    
+    return true;
+  } catch (error) {
+    console.error('Error checking table:', error);
+    return false;
+  }
+}
+
 // Load user-specific images
 async function loadUserImages() {
   if (!currentUser) {
@@ -1793,6 +1817,14 @@ async function loadUserImages() {
   }
   
   try {
+    // First ensure table exists
+    const tableExists = await ensureTableExists();
+    if (!tableExists) {
+      images = [];
+      renderGrid();
+      return;
+    }
+
     const { data, error } = await supabase
       .from('images')
       .select('*')
@@ -1843,12 +1875,12 @@ async function uploadImage(file) {
     const fileExt = file.name.split('.').pop().toLowerCase();
     const fileName = `${Date.now()}-${Math.random().toString(36).substring(2, 15)}.${fileExt}`;
     
-    // Use simple path without user folder for easier permissions
-    const filePath = fileName;
+    // Create user-specific folder structure
+    const filePath = `${currentUser.id}/${fileName}`;
     
     console.log('Uploading to:', filePath);
 
-    // Try to upload to storage with simpler path
+    // Upload to storage
     const { data: storageData, error: storageError } = await supabase
       .storage
       .from(BUCKET_NAME)
@@ -1860,13 +1892,26 @@ async function uploadImage(file) {
     if (storageError) {
       console.error('Storage upload error:', storageError);
       
-      // Provide helpful error messages
-      if (storageError.message?.includes('not found') || storageError.statusCode === 404) {
+      // Try to create user folder if it doesn't exist
+      if (storageError.message?.includes('bucket not found')) {
         showNotification('❌ Storage bucket not found. Please create "inspire-board" bucket in Supabase Storage.', '❌');
-      } else if (storageError.statusCode === 403 || storageError.message?.includes('permission')) {
-        showNotification('❌ Permission denied. Please set bucket to public and add proper policies.', '❌');
-      } else if (storageError.message?.includes('already exists')) {
-        showNotification('❌ File with this name already exists. Please try again.', '❌');
+      } else if (storageError.statusCode === 403) {
+        // Try simple path without user folder
+        const simplePath = fileName;
+        console.log('Trying simple path:', simplePath);
+        
+        const { data: simpleUpload, error: simpleError } = await supabase
+          .storage
+          .from(BUCKET_NAME)
+          .upload(simplePath, file);
+          
+        if (simpleError) {
+          showNotification('❌ Upload failed. Please check storage permissions.', '❌');
+        } else {
+          // Success with simple path
+          await processUploadSuccess(simplePath, fileName, file);
+        }
+        return;
       } else {
         showNotification(`❌ Upload failed: ${storageError.message || 'Unknown error'}`, '❌');
       }
@@ -1874,7 +1919,17 @@ async function uploadImage(file) {
     }
 
     console.log('Storage upload successful:', storageData);
+    await processUploadSuccess(filePath, fileName, file);
+    
+  } catch (error) {
+    console.error('Unexpected upload error:', error);
+    showNotification('Upload failed unexpectedly', '❌');
+  }
+}
 
+// Helper function to process successful upload
+async function processUploadSuccess(filePath, fileName, file) {
+  try {
     // Get public URL
     const { data: { publicUrl } } = supabase
       .storage
@@ -1895,7 +1950,8 @@ async function uploadImage(file) {
       filepath: filePath,
       note: '',
       liked: false,
-      user_id: currentUser.id
+      user_id: currentUser.id,
+      created_at: new Date().toISOString()
     };
     
     console.log('Inserting into database:', imageData);
@@ -1933,8 +1989,8 @@ async function uploadImage(file) {
     return newImage;
     
   } catch (error) {
-    console.error('Unexpected upload error:', error);
-    showNotification('Upload failed unexpectedly', '❌');
+    console.error('Error in processUploadSuccess:', error);
+    showNotification('Failed to process uploaded image', '❌');
   }
 }
 
@@ -1972,14 +2028,17 @@ async function deleteImageSupabase(id, url, filepath) {
 
     // Delete from storage if filepath exists
     if (filepath) {
-      const { error: storageError } = await supabase
-        .storage
-        .from(BUCKET_NAME)
-        .remove([filepath]);
-      
-      if (storageError) {
-        console.error('Storage delete error:', storageError);
-        // Continue even if storage delete fails
+      try {
+        const { error: storageError } = await supabase
+          .storage
+          .from(BUCKET_NAME)
+          .remove([filepath]);
+        
+        if (storageError) {
+          console.error('Storage delete error:', storageError);
+        }
+      } catch (storageError) {
+        console.error('Storage deletion failed:', storageError);
       }
     }
 
