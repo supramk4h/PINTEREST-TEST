@@ -1504,7 +1504,7 @@ let IDLE_TIMEOUT = 10000;
 let idleTimer;
 let currentUser = null;
 
-// Bucket name
+// Bucket name - make sure this matches your Supabase bucket
 const BUCKET_NAME = 'inspire-board';
 
 // Rose petal emojis
@@ -1815,31 +1815,40 @@ async function loadUserImages() {
   }
 }
 
-// Upload image to Supabase Storage and table
+// ==================== FIXED UPLOAD FUNCTION ====================
+
 async function uploadImage(file) {
   if (!currentUser) {
     showNotification('Please login to upload images', '🔒');
     return;
   }
   
+  console.log('=== UPLOAD STARTED ===');
+  console.log('User:', currentUser.id, currentUser.email);
+  console.log('File:', file.name, file.type, file.size);
+  
   try {
-    // Check file size (limit to 5MB)
-    if (file.size > 5 * 1024 * 1024) {
-      showNotification('File too large (max 5MB) ❌', '❌');
+    // Validate file
+    if (!file.type.startsWith('image/')) {
+      showNotification('Please upload an image file', '❌');
       return;
     }
     
-    // Check file type
-    if (!file.type.startsWith('image/')) {
-      showNotification('Please upload an image file ❌', '❌');
+    if (file.size > 5 * 1024 * 1024) {
+      showNotification('File too large (max 5MB)', '❌');
       return;
     }
 
-    const fileExt = file.name.split('.').pop();
-    const fileName = `${Date.now()}.${fileExt}`;
-    const filePath = `${currentUser.id}/${fileName}`;
+    // Generate unique filename
+    const fileExt = file.name.split('.').pop().toLowerCase();
+    const fileName = `${Date.now()}-${Math.random().toString(36).substring(2, 15)}.${fileExt}`;
+    
+    // Use simple path without user folder for easier permissions
+    const filePath = fileName;
+    
+    console.log('Uploading to:', filePath);
 
-    // Upload to storage
+    // Try to upload to storage with simpler path
     const { data: storageData, error: storageError } = await supabase
       .storage
       .from(BUCKET_NAME)
@@ -1849,67 +1858,83 @@ async function uploadImage(file) {
       });
 
     if (storageError) {
-      console.error('Storage upload error:', storageError.message || storageError);
+      console.error('Storage upload error:', storageError);
       
-      if (storageError.message.includes('permission') || storageError.message.includes('403')) {
-        showNotification('Permission denied. Please check storage policies for the inspire-board bucket.', '⚠️');
+      // Provide helpful error messages
+      if (storageError.message?.includes('not found') || storageError.statusCode === 404) {
+        showNotification('❌ Storage bucket not found. Please create "inspire-board" bucket in Supabase Storage.', '❌');
+      } else if (storageError.statusCode === 403 || storageError.message?.includes('permission')) {
+        showNotification('❌ Permission denied. Please set bucket to public and add proper policies.', '❌');
+      } else if (storageError.message?.includes('already exists')) {
+        showNotification('❌ File with this name already exists. Please try again.', '❌');
       } else {
-        showNotification(`Upload failed: ${storageError.message} ❌`, '❌');
+        showNotification(`❌ Upload failed: ${storageError.message || 'Unknown error'}`, '❌');
       }
       return;
     }
 
+    console.log('Storage upload successful:', storageData);
+
     // Get public URL
-    const { data: urlData } = await supabase
+    const { data: { publicUrl } } = supabase
       .storage
       .from(BUCKET_NAME)
       .getPublicUrl(filePath);
     
-    const publicUrl = urlData?.publicUrl;
+    console.log('Public URL:', publicUrl);
 
     if (!publicUrl) {
-      console.error('Error getting public URL:', urlData);
-      showNotification('Could not get public URL ❌', '❌');
+      showNotification('Could not get image URL', '❌');
       return;
     }
 
-    // Insert into Supabase table
+    // Insert into database
+    const imageData = {
+      url: publicUrl,
+      filename: fileName,
+      filepath: filePath,
+      note: '',
+      liked: false,
+      user_id: currentUser.id
+    };
+    
+    console.log('Inserting into database:', imageData);
+    
     const { data: newImage, error: insertError } = await supabase
       .from('images')
-      .insert([{ 
-        url: publicUrl, 
-        liked: false, 
-        note: '',
-        filename: fileName,
-        filepath: filePath,
-        user_id: currentUser.id
-      }])
+      .insert([imageData])
       .select()
       .single();
 
     if (insertError) {
-      console.error('Error inserting into table:', insertError.message || insertError);
-      showNotification('Upload failed ❌', '❌');
+      console.error('Database insert error:', insertError);
+      showNotification('Failed to save image to database', '❌');
       
-      // Try to delete the uploaded file if table insert fails
+      // Try to clean up storage file
       try {
         await supabase.storage.from(BUCKET_NAME).remove([filePath]);
-      } catch (deleteError) {
-        console.error('Failed to clean up file:', deleteError);
+        console.log('Cleaned up orphaned file');
+      } catch (cleanupError) {
+        console.error('Cleanup failed:', cleanupError);
       }
       
       return;
     }
 
-    // Add to local images array
+    console.log('Database insert successful:', newImage);
+
+    // Update UI
     images.unshift(newImage);
     renderGrid();
-    showNotification('Image uploaded successfully! 📸', '✅');
+    showNotification('Image uploaded successfully!', '📸');
     hideIdleMessage();
+    
+    console.log('=== UPLOAD COMPLETE ===');
     return newImage;
+    
   } catch (error) {
-    console.error('Error in uploadImage:', error);
-    showNotification('Upload failed ❌', '❌');
+    console.error('Unexpected upload error:', error);
+    showNotification('Upload failed unexpectedly', '❌');
   }
 }
 
@@ -1922,7 +1947,7 @@ async function updateImage(id, changes) {
       .eq('id', id);
 
     if (error) {
-      console.error('Error updating image:', error.message || error);
+      console.error('Error updating image:', error);
       throw error;
     }
   } catch (error) {
@@ -1941,11 +1966,11 @@ async function deleteImageSupabase(id, url, filepath) {
       .eq('id', id);
 
     if (tableError) {
-      console.error('Error deleting from table:', tableError.message || tableError);
+      console.error('Error deleting from table:', tableError);
       throw tableError;
     }
 
-    // Delete from storage
+    // Delete from storage if filepath exists
     if (filepath) {
       const { error: storageError } = await supabase
         .storage
@@ -1953,17 +1978,50 @@ async function deleteImageSupabase(id, url, filepath) {
         .remove([filepath]);
       
       if (storageError) {
-        console.error('Storage delete error:', storageError.message || storageError);
+        console.error('Storage delete error:', storageError);
         // Continue even if storage delete fails
       }
     }
 
-    showNotification('Image deleted 🗑️', '🗑️');
+    showNotification('Image deleted', '🗑️');
     return true;
   } catch (error) {
     console.error('Error in deleteImageSupabase:', error);
-    showNotification('Delete failed ❌', '❌');
+    showNotification('Delete failed', '❌');
     throw error;
+  }
+}
+
+// ==================== STORAGE TEST FUNCTION ====================
+
+async function testStorageConnection() {
+  console.log('Testing storage connection...');
+  
+  try {
+    // Try to list files in the bucket
+    const { data, error } = await supabase.storage.from(BUCKET_NAME).list();
+    
+    if (error) {
+      console.error('Storage test failed:', error);
+      
+      if (error.message?.includes('not found') || error.statusCode === 404) {
+        console.error('❌ Bucket not found. Please create it in Supabase Storage.');
+        showNotification('Storage bucket not found. Please create "inspire-board" in Supabase Storage.', '⚠️');
+      } else if (error.statusCode === 403) {
+        console.error('❌ Permission denied. Please check storage policies.');
+        showNotification('Storage permission denied. Please check bucket policies.', '⚠️');
+      }
+      
+      return false;
+    }
+    
+    console.log('✅ Storage connection successful!');
+    console.log('Files in bucket:', data?.length || 0);
+    return true;
+    
+  } catch (error) {
+    console.error('Storage test error:', error);
+    return false;
   }
 }
 
@@ -2158,12 +2216,12 @@ function toggleLike(index) {
     .catch(error => {
       // Revert on error
       image.liked = !newLikedState;
-      showNotification('Failed to update like ❌', '❌');
+      showNotification('Failed to update like', '❌');
     });
 
   showHeartOnCard(index);
   showNotification(
-    newLikedState ? 'Added to favorites 🌹' : 'Removed from favorites',
+    newLikedState ? 'Added to favorites' : 'Removed from favorites',
     newLikedState ? '❤️' : '💔'
   );
 }
@@ -2202,12 +2260,12 @@ function saveNote() {
     
     updateImage(image.id, { note: newNote })
       .then(() => {
-        showNotification('Note saved 💭', '💭');
+        showNotification('Note saved', '💭');
       })
       .catch(error => {
         // Revert on error
         image.note = oldNote;
-        showNotification('Failed to save note ❌', '❌');
+        showNotification('Failed to save note', '❌');
       });
     
     editingNoteIndex = null;
@@ -2260,10 +2318,10 @@ async function copyImage(index) {
       document.execCommand('copy');
       textArea.remove();
     }
-    showNotification('Image URL copied to clipboard 📋', '📋');
+    showNotification('Image URL copied to clipboard', '📋');
   } catch (e) {
     console.error('Copy failed', e);
-    showNotification('Copy failed ❌', '❌');
+    showNotification('Copy failed', '❌');
   }
 }
 
@@ -2401,6 +2459,9 @@ async function initialize() {
   // Check auth status first
   await checkAuthStatus();
   
+  // Test storage connection
+  await testStorageConnection();
+  
   // Only load images if user is logged in
   if (currentUser) {
     await loadUserImages();
@@ -2465,7 +2526,7 @@ fileInput.addEventListener('change', async e => {
   
   showNotification(`Uploading ${files.length} image${files.length > 1 ? 's' : ''}...`, '⏳');
   
-  // Upload files sequentially to avoid overwhelming the server
+  // Upload files sequentially
   for (let file of files) {
     await uploadImage(file);
   }
@@ -2477,7 +2538,7 @@ toggleDark.addEventListener('click', () => {
   const isDark = document.body.classList.toggle('dark-mode');
   localStorage.setItem('inspireTheme', isDark ? 'dark' : 'light');
   switchEl.classList.toggle('active');
-  showNotification(isDark ? 'Dark mode enabled 🌙' : 'Light mode enabled ☀️', isDark ? '🌙' : '☀️');
+  showNotification(isDark ? 'Dark mode enabled' : 'Light mode enabled', isDark ? '🌙' : '☀️');
 });
 
 clearItem.addEventListener('click', clearAllData);
